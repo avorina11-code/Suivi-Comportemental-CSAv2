@@ -1,269 +1,423 @@
 # -*- coding: utf-8 -*-
 """
-analysis.py
-===========
-Logique métier : croise le planning théorique du jour avec les données
-réelles issues du "Agents pause report" Vocalcom, calcule les écarts
-(retard, dépassement de pause, départ anticipé) et classe chaque agent
-selon un statut comportemental.
+app.py
+======
+Application Streamlit d'analyse d'adhérence planning et de suivi
+comportemental pour centre de contacts (CSA).
+
+Croise le Planning Hebdo (théorique) avec les exports Vocalcom (réel)
+pour identifier automatiquement retards, dépassements de pause, départs
+anticipés et absences.
+
+Lancement :
+    streamlit run app.py
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from typing import Optional
 
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+import parsers as P
+import analysis as A
+import theme as T
+
+st.set_page_config(
+    page_title="Adhérence Planning CSA",
+    page_icon="📞",
+    layout="wide",
+)
+
+T.inject_global_style()
+
+# ==========================================================================
+# ÉTAT DE SESSION
+# ==========================================================================
+
+if "planning_df" not in st.session_state:
+    st.session_state.planning_df = None
+if "pause_result" not in st.session_state:
+    st.session_state.pause_result = None
+if "agents_report_df" not in st.session_state:
+    st.session_state.agents_report_df = None
+if "activities_df" not in st.session_state:
+    st.session_state.activities_df = None
+if "detections" not in st.session_state:
+    st.session_state.detections = []  # [(nom_fichier, type_detecte), ...]
 
 
-def _as_time(v) -> Optional[dt.time]:
-    """Ne renvoie v que si c'est réellement un datetime.time valide, sinon
-    None. Protège contre les valeurs mal typées qui peuvent remonter des
-    fichiers Excel (NaN, chaîne résiduelle, pandas.Timestamp, etc.) et qui
-    feraient planter dt.datetime.combine() ou une comparaison '>' avec un
-    TypeError."""
-    if isinstance(v, dt.time):
-        return v
-    return None
+# ==========================================================================
+# SIDEBAR — IMPORT & PARAMÈTRES
+# ==========================================================================
 
+st.sidebar.title("📁 Import des fichiers")
 
-def _minutes_between(t1, t2) -> Optional[float]:
-    """Retourne (t2 - t1) en minutes, ou None si une des deux valeurs
-    manque ou n'est pas un datetime.time exploitable."""
-    t1 = _as_time(t1)
-    t2 = _as_time(t2)
-    if t1 is None or t2 is None:
-        return None
-    d1 = dt.datetime.combine(dt.date.today(), t1)
-    d2 = dt.datetime.combine(dt.date.today(), t2)
-    return (d2 - d1).total_seconds() / 60.0
+planning_file = st.sidebar.file_uploader(
+    "Planning Hebdo (théorique) — .xlsx",
+    type=["xlsx"],
+    help="Fichier obligatoire. Doit contenir une feuille 'Planning_Hebdo' "
+    "avec les colonnes Matricule_RH, Login_Vocalcom, Nom_Prenom et les "
+    "heures de début/fin par jour.",
+)
 
+vocalcom_files = st.sidebar.file_uploader(
+    "Exports Vocalcom (réel) — .xls / .xlsx",
+    type=["xls", "xlsx"],
+    accept_multiple_files=True,
+    help="Déposez ici un ou plusieurs exports Vocalcom : 'Agents pause "
+    "report' (obligatoire), et éventuellement 'Agents report' et/ou "
+    "'Agents activities by dates'. Le type de chaque fichier est détecté "
+    "AUTOMATIQUEMENT à partir de son contenu — peu importe le nom du "
+    "fichier.",
+)
 
-def _safe_num(v) -> float:
-    """Neutralise en 0.0 les valeurs None/NaN. Nécessaire car un float NaN
-    est "truthy" en Python : `nan or 0` renvoie nan (pas 0), ce qui fait
-    planter tout code qui suppose que `x or 0` protège contre les valeurs
-    manquantes une fois les données passées par un DataFrame pandas
-    (colonnes numériques avec valeurs manquantes -> NaN, pas None)."""
-    if v is None:
-        return 0.0
-    try:
-        if pd.isna(v):
-            return 0.0
-    except (TypeError, ValueError):
-        pass
-    return float(v)
+st.sidebar.markdown("---")
+st.sidebar.subheader("⚙️ Paramètres")
 
-
-def build_matrice_comportementale(
-    shift_today: pd.DataFrame,
-    pause_summary: pd.DataFrame,
-    *,
-    seuil_retard_min: int = 5,
-    pause_autorisee_min: int = 30,
-    seuil_depassement_alerte_min: int = 5,
-    export_temps_reel: bool = False,
-    heure_extraction: Optional[dt.time] = None,
-    report_date: Optional[dt.date] = None,
-) -> pd.DataFrame:
-    """Construit la matrice comportementale complète, une ligne par agent
-    présent dans le planning du jour.
-
-    Règles appliquées (voir cahier des charges) :
-      - Agent planifié mais absent du rapport Vocalcom -> Absence non
-        justifiée, SAUF si l'heure de prise de poste prévue n'est pas
-        encore passée à l'heure de référence (voir ci-dessous) : dans ce
-        cas l'agent est simplement "pas encore commencé", pas absent.
-      - Agent noté OFF/CONGE/... au planning -> Non planifié (statut neutre)
-      - Retard = Arrivée réelle - Début prévu (compté seulement si > seuil)
-      - Dépassement pause = Pause réelle - Pause autorisée
-      - Départ anticipé = Fin prévue - Départ réel (ignoré si export en
-        cours de journée et fin de poste prévue > heure d'extraction)
-
-    Heure de référence utilisée pour juger si un shift a "déjà commencé" :
-      - Si `report_date` correspond à la date du jour ET `export_temps_reel`
-        est coché avec une `heure_extraction` fournie -> on utilise cette
-        heure d'extraction (l'export ne "voit" pas encore ce qui se passe
-        après cette heure-là).
-      - Sinon, si `report_date` correspond à la date du jour -> on utilise
-        l'heure actuelle (dt.datetime.now().time()), car on est en train
-        de consulter le tableau de bord en direct.
-      - Si `report_date` est une date passée (export clôturé d'une
-        journée déjà terminée), aucune heure de référence n'est
-        appliquée : un agent planifié non pointé est bien considéré
-        absent, quelle que soit l'heure prévue de son shift.
-    """
-    df = shift_today.merge(
-        pause_summary, on="Login", how="left", suffixes=("", "_reel")
+export_temps_reel = st.sidebar.checkbox(
+    "Export en cours de journée (Temps Réel)",
+    value=False,
+    help="Cochez si l'export Vocalcom a été réalisé en pleine journée. "
+    "Désactive l'alerte de départ anticipé pour les agents dont le "
+    "shift prévisionnel se termine après l'heure d'extraction indiquée, "
+    "et désactive l'alerte d'absence pour les agents dont le shift "
+    "prévisionnel commence après l'heure d'extraction indiquée.",
+)
+heure_extraction = None
+if export_temps_reel:
+    heure_extraction = st.sidebar.time_input(
+        "Heure d'extraction", value=dt.time(13, 0)
     )
 
-    if report_date is not None and report_date == dt.date.today():
-        if export_temps_reel and heure_extraction is not None:
-            heure_reference = _as_time(heure_extraction)
-        else:
-            heure_reference = dt.datetime.now().time()
-    else:
-        heure_reference = None
+seuil_retard = st.sidebar.number_input(
+    "Seuil de retard toléré (min)", min_value=0, max_value=60, value=5, step=1
+)
+pause_autorisee = st.sidebar.number_input(
+    "Pause autorisée (min)", min_value=0, max_value=180, value=30, step=5
+)
+seuil_depassement_alerte = st.sidebar.number_input(
+    "Seuil d'alerte dépassement pause (min)", min_value=0, max_value=60, value=5, step=1
+)
 
-    records = []
-    for _, r in df.iterrows():
-        statut_planning = r["Statut_planning"]
-        a_pointe = pd.notna(r.get("Arrivee_reelle"))
+st.sidebar.markdown("---")
+process_btn = st.sidebar.button("🔄 Analyser", type="primary", use_container_width=True)
 
-        retard_min = None
-        depassement_pause_min = None
-        depart_anticipe_min = None
-        depart_anticipe_ignore = False
 
-        if statut_planning != "TRAVAIL":
-            statut_comportemental = "⚪ Non planifié (OFF/Congé)"
-        elif not a_pointe:
-            debut_prevu_check = _as_time(r.get("Debut_prevu"))
-            pas_encore_commence = (
-                heure_reference is not None
-                and debut_prevu_check is not None
-                and debut_prevu_check > heure_reference
-            )
-            if pas_encore_commence:
-                statut_comportemental = "⌛ Pas encore commencé"
-            else:
-                statut_comportemental = "🚫 Absence non justifiée"
-        else:
-            debut_prevu = r.get("Debut_prevu")
-            fin_prevu = r.get("Fin_prevu")
-            arrivee = r.get("Arrivee_reelle")
-            depart = r.get("Depart_reel")
-            duree_pause_reelle = r.get("Duree_pause_min")
+# ==========================================================================
+# TRAITEMENT DES IMPORTS
+# ==========================================================================
 
-            # --- Retard à la prise de poste ---
-            ecart_arrivee = _minutes_between(debut_prevu, arrivee)
-            if ecart_arrivee is not None and ecart_arrivee > seuil_retard_min:
-                retard_min = round(ecart_arrivee, 1)
-            else:
-                retard_min = 0.0
+def _process_uploads():
+    detections = []
 
-            # --- Dépassement de pause ---
-            try:
-                duree_pause_num = float(duree_pause_reelle) if pd.notna(duree_pause_reelle) else None
-            except (TypeError, ValueError):
-                duree_pause_num = None
-            if duree_pause_num is not None:
-                depassement_pause_min = round(duree_pause_num - pause_autorisee_min, 1)
-                if depassement_pause_min < 0:
-                    depassement_pause_min = 0.0
-            else:
-                depassement_pause_min = 0.0
+    if planning_file is not None:
+        try:
+            st.session_state.planning_df = P.load_planning(planning_file)
+        except Exception as exc:  # noqa: BLE001
+            st.sidebar.error(f"Erreur lecture Planning Hebdo : {exc}")
+            st.session_state.planning_df = None
 
-            # --- Départ anticipé (avec correction export "temps réel") ---
-            fin_prevu_t = _as_time(fin_prevu)
-            heure_extraction_t = _as_time(heure_extraction)
-            fin_ignoree = (
-                export_temps_reel
-                and heure_extraction_t is not None
-                and fin_prevu_t is not None
-                and fin_prevu_t > heure_extraction_t
-            )
-            if fin_ignoree:
-                depart_anticipe_ignore = True
-                depart_anticipe_min = 0.0
-            else:
-                ecart_depart = _minutes_between(depart, fin_prevu)
-                if ecart_depart is not None and ecart_depart > 0:
-                    depart_anticipe_min = round(ecart_depart, 1)
+    st.session_state.pause_result = None
+    st.session_state.agents_report_df = None
+    st.session_state.activities_df = None
+
+    for f in vocalcom_files or []:
+        try:
+            rtype, result = P.load_any_vocalcom_export(f, filename=f.name)
+        except Exception as exc:  # noqa: BLE001
+            detections.append((f.name, f"❌ Erreur : {exc}"))
+            continue
+
+        label = {
+            "pause_report": "✅ Agents pause report (obligatoire)",
+            "agents_report": "ℹ️ Agents report (détail états, optionnel)",
+            "activities_by_date": "ℹ️ Agents activities by dates (résumé, optionnel)",
+            "unknown": "⚠️ Type non reconnu — fichier ignoré",
+        }.get(rtype, rtype)
+        detections.append((f.name, label))
+
+        if rtype == "pause_report":
+            st.session_state.pause_result = result
+        elif rtype == "agents_report":
+            st.session_state.agents_report_df = result
+        elif rtype == "activities_by_date":
+            st.session_state.activities_df = result
+
+    st.session_state.detections = detections
+
+
+if process_btn:
+    _process_uploads()
+
+if st.session_state.detections:
+    with st.sidebar.expander("🔍 Détection automatique des fichiers", expanded=True):
+        for fname, label in st.session_state.detections:
+            st.write(f"**{fname}**")
+            st.caption(label)
+
+
+# ==========================================================================
+# GARDE-FOUS
+# ==========================================================================
+
+T.hero_banner(
+    "📞 Adhérence Planning & Suivi Comportemental — CSA",
+    "Analyse factuelle des retards, pauses et absences à partir des logs Vocalcom",
+)
+
+if st.session_state.planning_df is None or st.session_state.pause_result is None:
+    st.info(
+        "👈 Importez le **Planning Hebdo** ainsi qu'au moins un export "
+        "Vocalcom de type **Agents pause report** dans la barre latérale, "
+        "puis cliquez sur **Analyser**."
+    )
+    st.markdown(
+        """
+### Rappel des fichiers attendus
+| Fichier | Statut | Contenu utilisé |
+|---|---|---|
+| Planning Hebdo | **Obligatoire** | Heures théoriques de début/fin par jour et par agent |
+| Agents pause report | **Obligatoire** | Arrivée/départ réels, durée de pause, timeline des pauses par tranche de 30 min |
+| Agents report | Optionnel | Détail des états (Attente, Traitement, Post-travail, Pause…) pour enrichir l'analyse |
+| Agents activities by dates | Optionnel | Résumé arrivée/départ en secours (nom tronqué, jointure par Login uniquement) |
+
+⚠️ Le **type réel** de chaque export Vocalcom est détecté automatiquement
+à partir de son contenu, indépendamment de son nom de fichier (les
+exports Vocalcom sont parfois nommés de façon trompeuse).
+        """
+    )
+    st.stop()
+
+
+# ==========================================================================
+# CONSTRUCTION DE LA MATRICE COMPORTEMENTALE
+# ==========================================================================
+
+pause_result = st.session_state.pause_result
+report_date = pause_result.date or dt.date.today()
+jour_semaine = P.date_to_jour_fr(report_date)
+
+st.caption(
+    f"📅 Date détectée dans l'export Vocalcom : **{report_date.strftime('%d/%m/%Y')}** "
+    f"→ colonne planning ciblée automatiquement : **{jour_semaine}**"
+)
+
+shift_today = P.get_shift_for_day(st.session_state.planning_df, jour_semaine)
+
+# Agents présents dans le Vocalcom mais absents du planning (matricule inconnu)
+logins_planning = set(shift_today["Login"])
+logins_pointes = set(pause_result.summary["Login"]) if not pause_result.summary.empty else set()
+logins_hors_planning = logins_pointes - logins_planning
+
+matrice = A.build_matrice_comportementale(
+    shift_today,
+    pause_result.summary,
+    seuil_retard_min=seuil_retard,
+    pause_autorisee_min=pause_autorisee,
+    seuil_depassement_alerte_min=seuil_depassement_alerte,
+    export_temps_reel=export_temps_reel,
+    heure_extraction=heure_extraction,
+    report_date=report_date,
+)
+
+tab1, tab2, tab3 = st.tabs(
+    ["📊 Vue Équipe & Indicateurs", "⏱️ Timeline & Distribution des Pauses", "📝 Fiche Individuelle"]
+)
+
+
+# ==========================================================================
+# ONGLET 1 — VUE ÉQUIPE
+# ==========================================================================
+
+with tab1:
+    nb_presents = (matrice["Arrivee_reelle"].notna()).sum()
+    nb_absents = (matrice["Statut"] == "🚫 Absence non justifiée").sum()
+    nb_recadrer = (matrice["Statut"] == "🔴 Écart à recadrer").sum()
+    cumul_retards = matrice["Retard_min"].fillna(0).sum()
+    cumul_depassements = matrice["Depassement_pause_min"].fillna(0).sum()
+
+    T.render_kpi_row([
+        {"label": "Présents", "value": int(nb_presents), "icon": "🟢", "color": T.SUCCESS},
+        {"label": "Absents non justifiés", "value": int(nb_absents), "icon": "🚫", "color": T.DANGER,
+         "alert": nb_absents > 0},
+        {"label": "Cas à recadrer", "value": int(nb_recadrer), "icon": "🔴", "color": T.DANGER,
+         "alert": nb_recadrer > 0},
+        {"label": "Cumul retards plateau", "value": round(float(cumul_retards)), "icon": "⏱️",
+         "color": T.WARNING, "suffix": " min"},
+        {"label": "Cumul dépassements pause", "value": round(float(cumul_depassements)), "icon": "☕",
+         "color": T.ACCENT, "suffix": " min"},
+    ])
+
+
+    if logins_hors_planning:
+        st.warning(
+            f"⚠️ {len(logins_hors_planning)} login(s) présents dans l'export Vocalcom "
+            f"mais absents du Planning Hebdo pour {jour_semaine} : "
+            + ", ".join(sorted(logins_hors_planning))
+        )
+
+    st.markdown("### Matrice comportementale")
+    statuts_dispo = matrice["Statut"].unique().tolist()
+    filtre_statut = st.multiselect(
+        "Filtrer par statut", options=statuts_dispo, default=statuts_dispo
+    )
+    df_affiche = matrice[matrice["Statut"].isin(filtre_statut)].copy()
+
+    display_cols = [
+        "Matricule_RH", "Login", "Nom", "Statut_planning",
+        "Debut_prevu", "Fin_prevu", "Arrivee_reelle", "Depart_reel",
+        "Retard_min", "Duree_pause_min", "Depassement_pause_min",
+        "Depart_anticipe_min", "Statut",
+    ]
+    with st.container(border=True):
+        numeric_cols = ["Retard_min", "Duree_pause_min", "Depassement_pause_min", "Depart_anticipe_min"]
+        st.dataframe(
+            T.style_matrice(df_affiche[display_cols], status_col="Statut", numeric_cols=numeric_cols),
+            use_container_width=True, hide_index=True,
+        )
+
+    st.download_button(
+        "📥 Télécharger la matrice (CSV)",
+        data=df_affiche[display_cols].to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"matrice_comportementale_{report_date.isoformat()}.csv",
+        mime="text/csv",
+    )
+
+    if st.session_state.agents_report_df is not None:
+        with st.expander("ℹ️ Détail des états (source : Agents report)"):
+            st.dataframe(st.session_state.agents_report_df, use_container_width=True, hide_index=True)
+
+
+# ==========================================================================
+# ONGLET 2 — TIMELINE & DISTRIBUTION DES PAUSES
+# ==========================================================================
+
+with tab2:
+    timeline = pause_result.timeline
+
+    st.markdown("### Cumul des pauses par créneau (plateau entier)")
+    cumul_par_slot = (
+        timeline.groupby("Slot", as_index=False)["Pause_min"].sum().sort_values("Slot")
+    )
+    # Tri chronologique correct (00:00 -> 23:30) plutôt qu'alphabétique
+    ordre_slots = P.SLOTS_AM_24H + P.SLOTS_PM_24H
+    cumul_par_slot["Slot"] = pd.Categorical(cumul_par_slot["Slot"], categories=ordre_slots, ordered=True)
+    cumul_par_slot = cumul_par_slot.sort_values("Slot")
+
+    fig1 = px.bar(
+        cumul_par_slot,
+        x="Slot",
+        y="Pause_min",
+        labels={"Slot": "Créneau", "Pause_min": "Cumul pause (min)"},
+        title="Cumul de pause consommée par tranche de 30 minutes — plateau entier",
+        color="Pause_min",
+        color_continuous_scale=[T.ACCENT, T.PRIMARY],
+        template=T.PLOTLY_TEMPLATE_NAME,
+    )
+    fig1.update_layout(xaxis_tickangle=-45, coloraxis_showscale=False)
+    fig1.update_traces(hovertemplate="Créneau %{x}<br>Pause cumulée : %{y:.0f} min<extra></extra>")
+    with st.container(border=True):
+        st.plotly_chart(fig1, use_container_width=True)
+
+    st.markdown("### Timeline individuelle")
+    agents_avec_login = matrice[["Login", "Nom"]].drop_duplicates()
+    agents_avec_login["label"] = agents_avec_login["Login"] + " — " + agents_avec_login["Nom"].fillna("")
+    choix = st.selectbox("Choisir un agent", options=agents_avec_login["label"].tolist())
+    login_choisi = choix.split(" — ")[0] if choix else None
+
+    if login_choisi:
+        tl_agent = timeline[timeline["Login"] == login_choisi].copy()
+        tl_agent["Slot"] = pd.Categorical(tl_agent["Slot"], categories=ordre_slots, ordered=True)
+        tl_agent = tl_agent.sort_values("Slot")
+        fig2 = px.bar(
+            tl_agent,
+            x="Slot",
+            y="Pause_min",
+            labels={"Slot": "Créneau", "Pause_min": "Pause (min)"},
+            title=f"Consommation de pause — {choix}",
+            color="Pause_min",
+            color_continuous_scale=[T.ACCENT, T.PRIMARY],
+            template=T.PLOTLY_TEMPLATE_NAME,
+        )
+        fig2.update_layout(xaxis_tickangle=-45, coloraxis_showscale=False)
+        fig2.update_traces(hovertemplate="Créneau %{x}<br>Pause : %{y:.0f} min<extra></extra>")
+        with st.container(border=True):
+            st.plotly_chart(fig2, use_container_width=True)
+
+
+# ==========================================================================
+# ONGLET 3 — FICHE INDIVIDUELLE DE RECADRAGE
+# ==========================================================================
+
+with tab3:
+    agents_liste = matrice[["Login", "Nom"]].drop_duplicates()
+    agents_liste["label"] = agents_liste["Login"] + " — " + agents_liste["Nom"].fillna("")
+    choix_fiche = st.selectbox(
+        "Sélectionner un agent", options=agents_liste["label"].tolist(), key="fiche_select"
+    )
+    login_fiche = choix_fiche.split(" — ")[0] if choix_fiche else None
+
+    if login_fiche:
+        row = matrice[matrice["Login"] == login_fiche].iloc[0]
+
+        st.markdown(f"## {row['Nom']}  \n**Login :** {row['Login']} — **Matricule :** {row['Matricule_RH']}")
+        st.markdown(f"**Statut du jour :** {T.status_badge(row['Statut'])}", unsafe_allow_html=True)
+
+        # Les colonnes numériques de la matrice peuvent contenir NaN (agent
+        # non pointé, statut non "TRAVAIL", etc.) : on les neutralise en 0
+        # avec pd.isna plutôt qu'un simple "or 0", qui ne fonctionne PAS
+        # sur un NaN (un float NaN est "truthy" en Python -> "nan or 0"
+        # renvoie nan, ce qui faisait planter round(float(nan)) plus bas).
+        def _safe_num(v) -> float:
+            return 0.0 if v is None or pd.isna(v) else float(v)
+
+        retard = _safe_num(row["Retard_min"])
+        depassement = _safe_num(row["Depassement_pause_min"])
+        depart_anticipe_ignore = bool(row["Depart_anticipe_ignore"])
+        depart_anticipe = _safe_num(row["Depart_anticipe_min"])
+
+        with st.container(border=True):
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.markdown("#### 🕐 Prise de poste")
+                st.write(f"Prévu : {row['Debut_prevu']}")
+                st.write(f"Réel : {row['Arrivee_reelle']}")
+                T.render_kpi_row([{
+                    "label": "Retard", "value": round(float(retard)), "icon": "⏱️",
+                    "color": T.DANGER if retard > 0 else T.SUCCESS, "suffix": " min", "alert": retard > 0,
+                }], height=110)
+            with col_b:
+                st.markdown("#### ☕ Pauses")
+                st.write(f"Durée pause réelle : {_safe_num(row['Duree_pause_min']):.0f} min")
+                st.write(f"Pause autorisée : {pause_autorisee} min")
+                T.render_kpi_row([{
+                    "label": "Dépassement", "value": round(float(depassement)), "icon": "☕",
+                    "color": T.DANGER if depassement > 0 else T.SUCCESS, "suffix": " min", "alert": depassement > 0,
+                }], height=110)
+            with col_c:
+                st.markdown("#### 🏁 Fin de poste")
+                st.write(f"Prévu : {row['Fin_prevu']}")
+                st.write(f"Réel : {row['Depart_reel']}")
+                if depart_anticipe_ignore:
+                    st.info("Non évalué (export temps réel)")
                 else:
-                    depart_anticipe_min = 0.0
+                    T.render_kpi_row([{
+                        "label": "Départ anticipé", "value": round(float(depart_anticipe)), "icon": "🚪",
+                        "color": T.DANGER if depart_anticipe > 0 else T.SUCCESS, "suffix": " min",
+                        "alert": depart_anticipe > 0,
+                    }], height=110)
 
-            # --- Classification ---
-            ecart_majeur = (
-                (retard_min or 0) > seuil_retard_min
-                or (depassement_pause_min or 0) > seuil_depassement_alerte_min
-                or (depart_anticipe_min or 0) > 0
-            )
-            ecart_mineur = (
-                not ecart_majeur
-                and ((retard_min or 0) > 0 or (depassement_pause_min or 0) > 0)
-            )
-            if ecart_majeur:
-                statut_comportemental = "🔴 Écart à recadrer"
-            elif ecart_mineur:
-                statut_comportemental = "🟠 Écart mineur"
-            else:
-                statut_comportemental = "🟢 Conforme"
-
-        records.append(
-            {
-                "Matricule_RH": r.get("Matricule_RH"),
-                "Login": r.get("Login"),
-                "Nom": r.get("Nom") or r.get("Nom_Vocalcom"),
-                "Statut_planning": statut_planning,
-                "Debut_prevu": r.get("Debut_prevu"),
-                "Fin_prevu": r.get("Fin_prevu"),
-                "Arrivee_reelle": r.get("Arrivee_reelle"),
-                "Depart_reel": r.get("Depart_reel"),
-                "Retard_min": retard_min,
-                "Duree_pause_min": r.get("Duree_pause_min"),
-                "Depassement_pause_min": depassement_pause_min,
-                "Depart_anticipe_min": depart_anticipe_min,
-                "Depart_anticipe_ignore": depart_anticipe_ignore,
-                "Duree_travail_min": r.get("Duree_travail_min"),
-                "Statut": statut_comportemental,
-            }
+        st.markdown("---")
+        st.markdown("### 📝 Synthèse d'entretien (copier / coller)")
+        texte = A.synthese_recadrage(row, report_date)
+        st.text_area("Synthèse", value=texte, height=260, label_visibility="collapsed")
+        st.download_button(
+            "📥 Télécharger la synthèse (.txt)",
+            data=texte.encode("utf-8"),
+            file_name=f"synthese_{row['Login']}_{report_date.isoformat()}.txt",
+            mime="text/plain",
         )
-
-    return pd.DataFrame(records)
-
-
-def synthese_recadrage(row: pd.Series, date_jour: dt.date) -> str:
-    """Génère un texte de synthèse prêt à copier/coller pour un entretien
-    de recadrage RH/Superviseur, à partir d'une ligne de la matrice
-    comportementale.
-    """
-    nom = row.get("Nom") or "Agent"
-    login = row.get("Login")
-    date_str = date_jour.strftime("%d/%m/%Y") if date_jour else "date inconnue"
-
-    lignes = [f"Entretien de recadrage du {date_str} — {nom} (Login {login})", ""]
-
-    retard = _safe_num(row.get("Retard_min"))
-    depassement = _safe_num(row.get("Depassement_pause_min"))
-    depart_anticipe = _safe_num(row.get("Depart_anticipe_min"))
-
-    if retard > 0:
-        lignes.append(
-            f"• Prise de poste : retard de {retard:.0f} min constaté sur les logs "
-            f"Vocalcom (arrivée prévue {row.get('Debut_prevu')}, arrivée réelle "
-            f"{row.get('Arrivee_reelle')})."
-        )
-    else:
-        lignes.append("• Prise de poste : conforme au planning, aucun retard constaté.")
-
-    if depassement > 0:
-        lignes.append(
-            f"• Pauses : dépassement de {depassement:.0f} min par rapport au temps "
-            f"de pause autorisé (durée totale de pause relevée : "
-            f"{_safe_num(row.get('Duree_pause_min')):.0f} min)."
-        )
-    else:
-        lignes.append("• Pauses : consommation de pause conforme au temps autorisé.")
-
-    if row.get("Depart_anticipe_ignore"):
-        lignes.append(
-            "• Fin de poste : non évaluée (export réalisé en cours de journée, "
-            "avant la fin de poste prévue)."
-        )
-    elif depart_anticipe > 0:
-        lignes.append(
-            f"• Fin de poste : départ anticipé de {depart_anticipe:.0f} min avant "
-            f"l'heure de fin de poste prévue ({row.get('Fin_prevu')}, dernier "
-            f"pointage réel {row.get('Depart_reel')})."
-        )
-    else:
-        lignes.append("• Fin de poste : conforme au planning, aucun départ anticipé constaté.")
-
-    lignes.append("")
-    lignes.append(f"Statut global retenu : {row.get('Statut')}.")
-    lignes.append(
-        "Ces éléments sont issus des relevés automatiques Vocalcom et doivent être "
-        "présentés à l'agent à titre d'échange contradictoire avant toute décision RH."
-    )
-    return "\n".join(lignes)
