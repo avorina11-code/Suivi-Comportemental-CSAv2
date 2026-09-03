@@ -16,8 +16,22 @@ from typing import Optional
 import pandas as pd
 
 
-def _minutes_between(t1: Optional[dt.time], t2: Optional[dt.time]) -> Optional[float]:
-    """Retourne (t2 - t1) en minutes, ou None si une des deux valeurs manque."""
+def _as_time(v) -> Optional[dt.time]:
+    """Ne renvoie v que si c'est réellement un datetime.time valide, sinon
+    None. Protège contre les valeurs mal typées qui peuvent remonter des
+    fichiers Excel (NaN, chaîne résiduelle, pandas.Timestamp, etc.) et qui
+    feraient planter dt.datetime.combine() ou une comparaison '>' avec un
+    TypeError."""
+    if isinstance(v, dt.time):
+        return v
+    return None
+
+
+def _minutes_between(t1, t2) -> Optional[float]:
+    """Retourne (t2 - t1) en minutes, ou None si une des deux valeurs
+    manque ou n'est pas un datetime.time exploitable."""
+    t1 = _as_time(t1)
+    t2 = _as_time(t2)
     if t1 is None or t2 is None:
         return None
     d1 = dt.datetime.combine(dt.date.today(), t1)
@@ -85,7 +99,7 @@ def build_matrice_comportementale(
 
     if report_date is not None and report_date == dt.date.today():
         if export_temps_reel and heure_extraction is not None:
-            heure_reference = heure_extraction
+            heure_reference = _as_time(heure_extraction)
         else:
             heure_reference = dt.datetime.now().time()
     else:
@@ -104,7 +118,7 @@ def build_matrice_comportementale(
         if statut_planning != "TRAVAIL":
             statut_comportemental = "⚪ Non planifié (OFF/Congé)"
         elif not a_pointe:
-            debut_prevu_check = r.get("Debut_prevu")
+            debut_prevu_check = _as_time(r.get("Debut_prevu"))
             pas_encore_commence = (
                 heure_reference is not None
                 and debut_prevu_check is not None
@@ -129,19 +143,25 @@ def build_matrice_comportementale(
                 retard_min = 0.0
 
             # --- Dépassement de pause ---
-            if pd.notna(duree_pause_reelle):
-                depassement_pause_min = round(duree_pause_reelle - pause_autorisee_min, 1)
+            try:
+                duree_pause_num = float(duree_pause_reelle) if pd.notna(duree_pause_reelle) else None
+            except (TypeError, ValueError):
+                duree_pause_num = None
+            if duree_pause_num is not None:
+                depassement_pause_min = round(duree_pause_num - pause_autorisee_min, 1)
                 if depassement_pause_min < 0:
                     depassement_pause_min = 0.0
             else:
                 depassement_pause_min = 0.0
 
             # --- Départ anticipé (avec correction export "temps réel") ---
+            fin_prevu_t = _as_time(fin_prevu)
+            heure_extraction_t = _as_time(heure_extraction)
             fin_ignoree = (
                 export_temps_reel
-                and heure_extraction is not None
-                and fin_prevu is not None
-                and fin_prevu > heure_extraction
+                and heure_extraction_t is not None
+                and fin_prevu_t is not None
+                and fin_prevu_t > heure_extraction_t
             )
             if fin_ignoree:
                 depart_anticipe_ignore = True
